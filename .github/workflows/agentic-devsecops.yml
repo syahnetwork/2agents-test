@@ -1,0 +1,67 @@
+name:  Agentic DevSecOps Pipeline (2026)
+
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  HF_TOKEN: ${{ secrets.HF_TOKEN }} # Free HF tier for Forge
+
+jobs:
+  # ==========================================
+  # STAGE 1: AEGIS (Security Review Agent)
+  # ==========================================
+  aegis-review:
+    name: " Aegis: Security & Threat Review"
+    runs-on: ubuntu-latest
+    outputs:
+      vuln_report: ${{ steps.run_aegis.outputs.report }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Traditional Scanners (Context Gathering)
+        id: scan
+        run: |
+          # Run free OSS tools to give the LLM concrete data
+          npx semgrep --config=auto --json > semgrep_results.json || true
+          trufflehog filesystem . --json > secrets_results.json || true
+          
+      - name: Invoke AEGIS Agent (via GitHub Models - Free)
+        id: run_aegis
+        run: |
+          python3 .github/scripts/aegis_agent.py \
+            --semgrep semgrep_results.json \
+            --secrets secrets_results.json \
+            --pr_diff "$(gh pr diff ${{ github.event.pull_request.number }})"
+        env:
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================
+  # STAGE 2: FORGE (Auto-Remediation Agent)
+  # ==========================================
+  forge-remediate:
+    name: " Forge: Auto-Remediation"
+    needs: aegis-review
+    if: needs.aegis-review.outputs.vuln_report != 'CLEAN'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          
+      - name: Invoke FORGE Agent (via HuggingFace Free Tier)
+        id: run_forge
+        run: |
+          python3 .github/scripts/forge_agent.py \
+            --vuln_report "${{ needs.aegis-review.outputs.vuln_report }}"
+        env:
+          HF_API_TOKEN: ${{ secrets.HF_TOKEN }}
+          
+      - name: Commit and Push Fixes
+        run: |
+          git config user.name "Forge-Agent[bot]"
+          git config user.email "forge@agents.devsecops.2026"
+          git add .
+          git commit -m " [Forge] Auto-remediated vulnerabilities flagged by Aegis" || echo "No changes to commit"
+          git push
