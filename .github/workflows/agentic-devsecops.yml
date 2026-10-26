@@ -40,16 +40,30 @@ jobs:
             echo '[]' > secrets_results.json
           fi
           
+      - name: Fetch PR diff (file, to avoid shell-injection via raw interpolation)
+        id: diff
+        run: |
+          gh pr diff "${PR_NUMBER}" > pr_diff.txt 2>/dev/null || echo '' > pr_diff.txt
+          {
+            echo 'summary<<EOF'
+            head -c 4000 pr_diff.txt
+            echo ''
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+
       - name: Invoke AEGIS Agent (via GitHub Models - Free)
         id: run_aegis
+        env:
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 .github/scripts/aegis_agent.py \
             --semgrep semgrep_results.json \
             --secrets secrets_results.json \
-            --pr_diff "$(gh pr diff ${{ github.event.pull_request.number }} || echo '')"
-        env:
-          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            --pr_diff_file pr_diff.txt
 
   # ==========================================
   # STAGE 2: FORGE (Auto-Remediation Agent)
@@ -67,11 +81,12 @@ jobs:
 
       - name: Invoke FORGE Agent (deterministic auto-remediation)
         id: run_forge
+        env:
+          VULN_REPORT: ${{ needs.aegis-review.outputs.vuln_report }}
+          HF_API_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python3 .github/scripts/forge_agent.py \
-            --vuln_report "${{ needs.aegis-review.outputs.vuln_report }}"
-        env:
-          HF_API_TOKEN: ${{ secrets.HF_TOKEN }}
+            --vuln_report "$VULN_REPORT"
           
       - name: Commit and Push Fixes
         run: |

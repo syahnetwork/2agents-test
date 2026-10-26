@@ -20,6 +20,7 @@ def parse_args():
     p.add_argument("--semgrep", default="semgrep_results.json", help="Path to semgrep JSON output")
     p.add_argument("--secrets", default="secrets_results.json", help="Path to trufflehog JSON output")
     p.add_argument("--pr_diff", default="", help="The PR diff text")
+    p.add_argument("--pr_diff_file", default="", help="Path to a file containing the PR diff")
     return p.parse_args()
 
 
@@ -30,6 +31,15 @@ def read_file(path):
         return data if data.strip() else '{"results": []}'
     except OSError:
         return '{"results": []}'
+
+
+def read_text_file(path):
+    """Plain-text reader for the PR diff; returns '' when missing/empty."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
 
 
 def query_github_models(prompt):
@@ -64,6 +74,15 @@ SQLI_RE = re.compile(
     r"""f["']\s*(SELECT|UPDATE|DELETE|INSERT)[^\n]*?\{[^}]+\}[^\n]*?["']""",
     re.IGNORECASE,
 )
+# Also catch printf-style interpolation: "SELECT ... %s ... " % var  /  .format(...)
+SQLI_PERCENT_RE = re.compile(
+    r"""["'][^"'\n]*\b(SELECT|UPDATE|DELETE|INSERT)\b[^"'\n]*%[srf][^"'\n]*["']\s*%\s*\(?[A-Za-z_][\w.\[\]()'"]*""",
+    re.IGNORECASE,
+)
+SQLI_FORMAT_RE = re.compile(
+    r"""["'][^"'\n]*\b(SELECT|UPDATE|DELETE|INSERT)\b[^"'\n]*\{\d*\}[^"'\n]*["']\s*\.\s*format\s*\(""",
+    re.IGNORECASE,
+)
 
 
 def heuristic_scan(diff_text):
@@ -74,7 +93,17 @@ def heuristic_scan(diff_text):
         findings.append({"type": "api_key_literal", "cwe": "CWE-798", "evidence": m.group(0)[:120]})
     for m in SQLI_RE.finditer(diff_text):
         findings.append({"type": "sql_injection_logic_flaw", "cwe": "CWE-89", "evidence": m.group(0)[:120]})
-    return findings
+    for regex in (SQLI_PERCENT_RE, SQLI_FORMAT_RE):
+        for m in regex.finditer(diff_text):
+            findings.append({"type": "sql_injection_logic_flaw", "cwe": "CWE-89", "evidence": m.group(0)[:120]})
+    # De-duplicate while preserving order
+    seen, unique = set(), []
+    for f in findings:
+        key = (f["type"], f["evidence"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(f)
+    return unique
 
 
 def build_report(result_text, diff_text):
@@ -105,6 +134,8 @@ def build_report(result_text, diff_text):
 def main():
     args = parse_args()
     pr_diff = args.pr_diff or ""
+    if args.pr_diff_file:
+        pr_diff = read_text_file(args.pr_diff_file) or pr_diff
     semgrep_data = read_file(args.semgrep)
     secrets_data = read_file(args.secrets)
 
