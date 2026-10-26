@@ -103,6 +103,29 @@ SQLI_FORMAT_RE = re.compile(
 )
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][\w.\[\]'\"]*)\}")
 
+# Character classes are built from hex escapes so the regex source never
+# contains a literal quote character (shell-safe to embed anywhere).
+_DQ = chr(0x22)
+_SQ = chr(0x27)
+_QUOTE_CLASS = "[\\x22\\x27]"          # " or '
+_NONQUOTE_CLASS = "[^\\x22\\x27]"      # any char except " and '
+
+
+def _build_fstring_re():
+    """f-string SQLi pattern, assembled without literal quotes in the source:
+       f"SELECT ... {expr} ..."  /  f'SELECT ...'  (optional rb/br prefixes)"""
+    return re.compile(
+        "(?P<body>[rbu]{0,2})f(?P<quote>" + _QUOTE_CLASS + ")"
+        "(?P<sql>(?:SELECT|UPDATE|DELETE)(?:" + _NONQUOTE_CLASS + "|\\\\.)*?)"
+        "(?P<brace>\\{[^}]+\\})"
+        "(?P<tail>(?:" + _NONQUOTE_CLASS + "|\\\\.)*)"
+        "(?P=quote)",
+        re.IGNORECASE,
+    )
+
+
+SQLI_FSTRING_BUILDER_RE = _build_fstring_re()
+
 
 def fix_sqli_queries(root="."):
     fixed = []
