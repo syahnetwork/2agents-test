@@ -86,8 +86,19 @@ def fix_hardcoded_keys(root="."):
 # Only rewrites single-table SELECT/UPDATE/DELETE shaped queries; anything
 # more complex is left untouched for human review (fail-safe behavior).
 # ---------------------------------------------------------------------------
-SQLI_INTERP_RE = re.compile(
-    r'(?P<q>["\'])f((?:SELECT|UPDATE|DELETE)[^"\']*?\{[^}]+\}[^"\']*)\1',
+# f-string style:  f"SELECT ... {var} ..."
+SQLI_FSTRING_RE = re.compile(
+    r"""(?P<q>["'])f((?:SELECT|UPDATE|DELETE)[^"']*?\{[^}]+\}[^"']*?)\1""",
+    re.IGNORECASE,
+)
+# printf style:  "SELECT ... %s ..." % var   /   "SELECT ... %s ..." % (a, b)
+SQLI_PERCENT_RE = re.compile(
+    r"""(?P<q>["'])((?:SELECT|UPDATE|DELETE)[^"']*?%[srf][^"']*?)\1\s*%\s*(?P<args>\([^)]*\)|[A-Za-z_]\w*)""",
+    re.IGNORECASE,
+)
+# str.format style:  "SELECT ... {}".format(var)
+SQLI_FORMAT_RE = re.compile(
+    r"""(?P<q>["'])((?:SELECT|UPDATE|DELETE)[^"']*?\{\d*\}[^"']*?)\1\s*\.\s*format\((?P<args>[^)]*)\)""",
     re.IGNORECASE,
 )
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][\w.\[\]'\"]*)\}")
@@ -108,21 +119,54 @@ def fix_sqli_queries(root="."):
             except (OSError, UnicodeDecodeError):
                 continue
 
-            def repl(m):
+            def repl_fstring(m):
                 body = m.group(2)
                 params = PLACEHOLDER_RE.findall(body)
                 if not params:
                     return m.group(0)
                 converted = PLACEHOLDER_RE.sub("%s", body)
                 tuple_str = "({})".format(", ".join(params) + ("," if len(params) == 1 else ""))
-                return f'"{converted}", {tuple_str}'
+                return '"{}", {}'.format(converted, tuple_str)
 
-            new_src, n = SQLI_INTERP_RE.subn(repl, src)
-            if n:
+            def repl_percent(m):
+                body = m.group(2)
+                args_raw = m.group("args").strip()
+                # Already parameterized? ("%s" placeholders are DB-driver style; the
+                # flaw is the *% interpolation*, so convert execute-side to tuple arg.
+                if args_raw.startswith("("):
+                    inner = args_raw[1:-1].strip().rstrip(",")
+                    params = [p.strip() for p in inner.split(",") if p.strip()]
+                else:
+                    params = [args_raw]
+                if not params:
+                    return m.group(0)
+                tuple_str = "({})".format(", ".join(params) + ("," if len(params) == 1 else ""))
+                return '"{}", {}'.format(body, tuple_str)
+
+            def repl_format(m):
+                body = m.group(2)
+                args_raw = m.group("args").strip()
+                params = [p.strip() for p in args_raw.split(",") if p.strip()]
+                if not params:
+                    return m.group(0)
+                converted = re.sub(r"\{\d*\}", "%s", body)
+                tuple_str = "({})".format(", ".join(params) + ("," if len(params) == 1 else ""))
+                return '"{}", {}'.format(converted, tuple_str)
+
+            new_src = src
+            total = 0
+            for regex, fn in (
+                (SQLI_FSTRING_RE, repl_fstring),
+                (SQLI_PERCENT_RE, repl_percent),
+                (SQLI_FORMAT_RE, repl_format),
+            ):
+                new_src, n = regex.subn(fn, new_src)
+                total += n
+            if total:
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write(new_src)
-                fixed.append((path, n))
-                print(f"[Forge] Parameterized interpolated SQL in {path} ({n} query[ies])")
+                fixed.append((path, total))
+                print(f"[Forge] Parameterized interpolated SQL in {path} ({total} query[ies])")
     return fixed
 
 
