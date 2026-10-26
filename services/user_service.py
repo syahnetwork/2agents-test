@@ -5,5 +5,7 @@ import os
 
 def get_api_key():
     # CWE-798: hardcoded fallback API key used when the env var is missing.
-    API_KEY = os.environ.get("SERVICE_API_KEY") or "sk-fallback-hardcoded-secret-1234567890"
+    API_KEY = os.environ.get("SERVICE_API_KEY")
+    if not API_KEY:
+        raise RuntimeError("SERVICE_API_KEY is not configured; refusing to start without a secret.")
     return API_KEY
