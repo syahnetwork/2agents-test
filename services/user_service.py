@@ -1,18 +1,9 @@
-# Intentionally vulnerable sample flagged by security-policy.md.
-# FORGE agent should auto-remediate both patterns below.
+# Intentionally vulnerable sample tracked by security-policy.md.
+# AEGIS (Stage 1) flags CWE-798; FORGE (Stage 2) auto-remediates it.
 import os
 
-API_KEY = os.environ.get("SERVICE_API_KEY")
-if not API_KEY:
-    raise RuntimeError("SERVICE_API_KEY is not configured; refusing to start without a secret.")
 
-
-def get_user(db, user_id):
-    query = f"SELECT * FROM users WHERE id = '{user_id}'"
-    return db.execute(query)
-
-
-def find_orders(db, customer_id, status):
-    # printf-style interpolation flaw (CWE-89)
-    q = "SELECT amount FROM orders WHERE customer = %s AND status = '%s'" % (customer_id, status)
-    return db.execute(q)
+def get_api_key():
+    # CWE-798: hardcoded fallback API key used when the env var is missing.
+    API_KEY = os.environ.get("SERVICE_API_KEY") or "sk-fallback-hardcoded-secret-1234567890"
+    return API_KEY

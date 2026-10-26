@@ -1,11 +1,11 @@
 # .github/scripts/forge_agent.py
-"""FORGE — Auto-Remediation Agent (Stage 2 of the Agentic DevSecOps pipeline).
+"""FORGE - Auto-Remediation Agent (Stage 2 of the Agentic DevSecOps pipeline).
 
 Takes the vulnerability report produced by AEGIS and applies safe, deterministic
 fixes for the two classes of findings this repo's security-policy.md tracks:
 
-1. Hardcoded fallback API keys  -> env-var lookup with fail-closed validation.
-2. SQL injection logic flaws    -> parameterized queries instead of interpolation.
+1. Hardcoded fallback API keys (CWE-798) -> env-var lookup with fail-closed validation.
+2. SQL injection logic flaws     (CWE-89) -> parameterized queries instead of interpolation.
 
 If no automatic fix can be applied, it still exits 0 so the workflow can push
 whatever remediation was made (the commit step tolerates "nothing to commit").
@@ -37,15 +37,24 @@ def load_report(raw):
 # Fix 1: hardcoded fallback API key  (CWE-798)
 #   Pattern:  API_KEY = os.environ.get("X") or "sk-literal..."
 #   Replaced with an env-var lookup that fails closed when the secret is absent.
+#   The leading indentation is captured so the guard stays inside functions.
 # ---------------------------------------------------------------------------
 FALLBACK_KEY_RE = re.compile(
-    r'(?P<var>\w+)\s*=\s*os\.environ\.get\(\s*["\'](?P<env>[^"\']+)["\']\s*\)\s*(?:or|\|\|)\s*'
-    r'["\'][^"\']+["\']'
+    r"(?P<indent>^[ \t]*)(?P<var>\w+)\s*=\s*os\.environ\.get\(\s*[\"'](?P<env>[^\"']+)[\"']\s*\)\s*(?:or|\|\|)\s*"
+    r"[\"'][^\"']+[\"']",
+    re.MULTILINE,
 )
 
-FIX_TEMPLATE = '''{var} = os.environ.get("{env}")
-if not {var}:
-    raise RuntimeError("{env} is not configured; refusing to start without a secret.")'''
+
+def fix_hardcoded_key(match):
+    indent = match.group("indent")
+    var = match.group("var")
+    env = match.group("env")
+    return (
+        '{i}{v} = os.environ.get("{e}")\n'
+        "{i}if not {v}:\n"
+        '{i}    raise RuntimeError("{e} is not configured; refusing to start without a secret.")'
+    ).format(i=indent, v=var, e=env)
 
 
 def is_pipeline_script(path):
@@ -69,39 +78,86 @@ def fix_hardcoded_keys(root="."):
                 src = open(path, encoding="utf-8").read()
             except (OSError, UnicodeDecodeError):
                 continue
-            new_src, n = FALLBACK_KEY_RE.subn(
-                lambda m: FIX_TEMPLATE.format(var=m.group("var"), env=m.group("env")), src
-            )
+            new_src, n = FALLBACK_KEY_RE.subn(fix_hardcoded_key, src)
             if n:
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write(new_src)
                 fixed.append((path, n))
-                print(f"[Forge] Removed hardcoded fallback key(s) in {path} ({n} occurrence[s])")
+                print("[Forge] Removed hardcoded fallback key(s) in {} ({} occurrence[s])".format(path, n))
     return fixed
 
 
 # ---------------------------------------------------------------------------
 # Fix 2: SQLi via string-interpolated query  (CWE-89)
 #   f"SELECT ... WHERE id = '{x}'"  ->  "SELECT ... WHERE id = %s", (x,)
-# Only rewrites single-table SELECT/UPDATE/DELETE shaped queries; anything
-# more complex is left untouched for human review (fail-safe behavior).
+#   "SELECT ... WHERE x = '%s'" % y ->  "SELECT ... WHERE x = %s", (y,)
+#   "SELECT ... {}".format(z)       ->  "SELECT ... %s", (z,)
+# Quote-aware: one compiled variant per string delimiter, built from hex
+# escapes so this source file never needs fragile backreference tricks and
+# stays shell-safe. Only single-line SELECT/UPDATE/DELETE shaped queries are
+# rewritten; anything else is left untouched for human review (fail-safe).
 # ---------------------------------------------------------------------------
-# f-string style:  f"SELECT ... {var} ..."
-SQLI_FSTRING_RE = re.compile(
-    r"""(?P<q>["'])f((?:SELECT|UPDATE|DELETE)[^"']*?\{[^}]+\}[^"']*?)\1""",
-    re.IGNORECASE,
-)
-# printf style:  "SELECT ... %s ..." % var   /   "SELECT ... %s ..." % (a, b)
-SQLI_PERCENT_RE = re.compile(
-    r"""(?P<q>["'])((?:SELECT|UPDATE|DELETE)[^"']*?%[srf][^"']*?)\1\s*%\s*(?P<args>\([^)]*\)|[A-Za-z_]\w*)""",
-    re.IGNORECASE,
-)
-# str.format style:  "SELECT ... {}".format(var)
-SQLI_FORMAT_RE = re.compile(
-    r"""(?P<q>["'])((?:SELECT|UPDATE|DELETE)[^"']*?\{\d*\}[^"']*?)\1\s*\.\s*format\((?P<args>[^)]*)\)""",
-    re.IGNORECASE,
-)
-PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][\w.\[\]'\"]*)\}")
+PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][\w.\[\]]*)\}")
+_DQ = chr(0x22)  # double quote
+_SQ = chr(0x27)  # single quote
+
+
+def _compile_sql_patterns(delim_hex):
+    d = delim_hex
+    fstring = re.compile(
+        "\"f(?P<sql>(?:SELECT|UPDATE|DELETE)[^" + d + "]*?)\"" , re.IGNORECASE)
+    percent = re.compile(
+        "\"(?P<sql>(?:SELECT|UPDATE|DELETE)[^" + d + "]*?)\"" + "\\s*%\\s*(?P<args>\\([^)]*\\)|[A-Za-z_]\\w*)",
+        re.IGNORECASE,
+    )
+    fmt = re.compile(
+        "\"(?P<sql>(?:SELECT|UPDATE|DELETE)[^" + d + "]*?)\"" + "\\s*\\.\\s*format\\((?P<args>[^)]*)\\)",
+        re.IGNORECASE,
+    )
+    return fstring, percent, fmt
+
+
+SQLI_PATTERNS = _compile_sql_patterns("\\x22") + _compile_sql_patterns("\\x27")
+
+
+def _as_tuple(params):
+    joined = ", ".join(params)
+    if len(params) == 1:
+        joined += ","
+    return "({})".format(joined)
+
+
+def _repl_fstring(m):
+    body = m.group("sql")
+    params = PLACEHOLDER_RE.findall(body)
+    if not params:
+        return m.group(0)
+    converted = PLACEHOLDER_RE.sub("%s", body)
+    return '"{}", {}'.format(converted, _as_tuple(params))
+
+
+def _repl_percent(m):
+    body = m.group("sql")
+    args_raw = m.group("args").strip()
+    if args_raw.startswith("("):
+        params = [p.strip() for p in args_raw[1:-1].split(",") if p.strip()]
+    else:
+        params = [args_raw]
+    if not params:
+        return m.group(0)
+    return '"{}", {}'.format(body, _as_tuple(params))
+
+
+def _repl_format(m):
+    body = m.group("sql")
+    params = [p.strip() for p in m.group("args").split(",") if p.strip()]
+    if not params:
+        return m.group(0)
+    converted = re.sub(r"\{\d*\}", "%s", body)
+    return '"{}", {}'.format(converted, _as_tuple(params))
+
+
+_REPLACERS = (_repl_fstring, _repl_percent, _repl_format, _repl_fstring, _repl_percent, _repl_format)
 
 
 def fix_sqli_queries(root="."):
@@ -118,62 +174,24 @@ def fix_sqli_queries(root="."):
                 src = open(path, encoding="utf-8").read()
             except (OSError, UnicodeDecodeError):
                 continue
-
-            def repl_fstring(m):
-                body = m.group(2)
-                params = PLACEHOLDER_RE.findall(body)
-                if not params:
-                    return m.group(0)
-                converted = PLACEHOLDER_RE.sub("%s", body)
-                tuple_str = "({})".format(", ".join(params) + ("," if len(params) == 1 else ""))
-                return '"{}", {}'.format(converted, tuple_str)
-
-            def repl_percent(m):
-                body = m.group(2)
-                args_raw = m.group("args").strip()
-                # Already parameterized? ("%s" placeholders are DB-driver style; the
-                # flaw is the *% interpolation*, so convert execute-side to tuple arg.
-                if args_raw.startswith("("):
-                    inner = args_raw[1:-1].strip().rstrip(",")
-                    params = [p.strip() for p in inner.split(",") if p.strip()]
-                else:
-                    params = [args_raw]
-                if not params:
-                    return m.group(0)
-                tuple_str = "({})".format(", ".join(params) + ("," if len(params) == 1 else ""))
-                return '"{}", {}'.format(body, tuple_str)
-
-            def repl_format(m):
-                body = m.group(2)
-                args_raw = m.group("args").strip()
-                params = [p.strip() for p in args_raw.split(",") if p.strip()]
-                if not params:
-                    return m.group(0)
-                converted = re.sub(r"\{\d*\}", "%s", body)
-                tuple_str = "({})".format(", ".join(params) + ("," if len(params) == 1 else ""))
-                return '"{}", {}'.format(converted, tuple_str)
-
             new_src = src
             total = 0
-            for regex, fn in (
-                (SQLI_FSTRING_RE, repl_fstring),
-                (SQLI_PERCENT_RE, repl_percent),
-                (SQLI_FORMAT_RE, repl_format),
-            ):
-                new_src, n = regex.subn(fn, new_src)
+            for regex, repl in zip(SQLI_PATTERNS, _REPLACERS):
+                new_src, n = regex.subn(repl, new_src)
                 total += n
             if total:
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write(new_src)
                 fixed.append((path, total))
-                print(f"[Forge] Parameterized interpolated SQL in {path} ({total} query[ies])")
+                print("[Forge] Parameterized interpolated SQL in {} ({} query[ies])".format(path, total))
     return fixed
 
 
 def main():
     args = parse_args()
     report = load_report(args.vuln_report)
-    print(f"[Forge] Received AEGIS report status={report.get('status')} severity={report.get('severity')}")
+    print("[Forge] Received AEGIS report status={} severity={}".format(
+        report.get("status"), report.get("severity")))
 
     key_fixes = fix_hardcoded_keys()
     sqli_fixes = fix_sqli_queries()
@@ -182,7 +200,7 @@ def main():
     if total == 0:
         print("[Forge] No auto-fixable patterns found; leaving code unchanged for human review.")
     else:
-        print(f"[Forge] Applied remediations to {total} file(s).")
+        print("[Forge] Applied remediations to {} file(s).".format(total))
     sys.exit(0)
 
 
