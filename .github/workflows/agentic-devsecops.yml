@@ -4,6 +4,10 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: write        # Forge pushes auto-fix commits back to the PR branch
+  pull-requests: read    # Aegis reads the PR diff via gh
+
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   HF_TOKEN: ${{ secrets.HF_TOKEN }} # Free HF tier for Forge
@@ -19,13 +23,22 @@ jobs:
       vuln_report: ${{ steps.run_aegis.outputs.report }}
     steps:
       - uses: actions/checkout@v4
-      
+
+      - name: Install Scanner Tooling
+        run: |
+          python3 -m pip install --quiet semgrep trufflehog || true
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin || true
+
       - name: Run Traditional Scanners (Context Gathering)
         id: scan
         run: |
           # Run free OSS tools to give the LLM concrete data
-          npx semgrep --config=auto --json > semgrep_results.json || true
-          trufflehog filesystem . --json > secrets_results.json || true
+          semgrep --config=auto --json > semgrep_results.json 2>/dev/null || echo '{"results": []}' > semgrep_results.json
+          if command -v trufflehog >/dev/null 2>&1; then
+            trufflehog filesystem . --json > secrets_results.json 2>/dev/null || echo '[]' > secrets_results.json
+          else
+            echo '[]' > secrets_results.json
+          fi
           
       - name: Invoke AEGIS Agent (via GitHub Models - Free)
         id: run_aegis
@@ -33,9 +46,10 @@ jobs:
           python3 .github/scripts/aegis_agent.py \
             --semgrep semgrep_results.json \
             --secrets secrets_results.json \
-            --pr_diff "$(gh pr diff ${{ github.event.pull_request.number }})"
+            --pr_diff "$(gh pr diff ${{ github.event.pull_request.number }} || echo '')"
         env:
           GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ==========================================
   # STAGE 2: FORGE (Auto-Remediation Agent)
@@ -49,8 +63,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.head_ref }}
-          
-      - name: Invoke FORGE Agent (via HuggingFace Free Tier)
+          token: ${{ secrets.GITHUB_TOKEN }}  # needs contents:write to push fixes
+
+      - name: Invoke FORGE Agent (deterministic auto-remediation)
         id: run_forge
         run: |
           python3 .github/scripts/forge_agent.py \
